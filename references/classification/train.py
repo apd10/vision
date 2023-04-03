@@ -16,7 +16,7 @@ from torchvision.transforms.functional import InterpolationMode
 from controller_rp import RPController
 #from torchviz import make_dot
 
-def train_one_epoch(model, criterion, optimizer, data_loader, device, epoch, args, model_ema=None, scaler=None):
+def train_one_epoch(model, criterion, optimizer, data_loader, device, epoch, args, model_ema=None, scaler=None, num_steps_to_accumulate=1):
     model.train()
     metric_logger = utils.MetricLogger(delimiter="  ")
     metric_logger.add_meter("lr", utils.SmoothedValue(window_size=1, fmt="{value}"))
@@ -29,25 +29,42 @@ def train_one_epoch(model, criterion, optimizer, data_loader, device, epoch, arg
             image, target = image.to(device), target.to(device)
             with torch.cuda.amp.autocast(enabled=scaler is not None):
                 output = model(image)
-                loss = criterion(output, target)
+                loss = criterion(output, target) / num_steps_to_accumulate
                 #make_dot(loss.mean(), params = dict(model.named_parameters()), show_saved=True, show_attrs=True).render("vit", "svg")
                 #return
-    
-            optimizer.zero_grad()
+            update_this_step =  (i % num_steps_to_accumulate == 0)
             if scaler is not None:
-                scaler.scale(loss).backward()
-                if args.clip_grad_norm is not None:
-                    # we should unscale the gradients of optimizer's assigned params if do gradient clipping
-                    scaler.unscale_(optimizer)
-                    nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad_norm)
-                scaler.step(optimizer)
-                scaler.update()
+                if update_this_step:
+                    scaler.scale(loss).backward()
+                    if args.clip_grad_norm is not None:
+                        # we should unscale the gradients of optimizer's assigned params if do gradient clipping
+                        scaler.unscale_(optimizer)
+                        nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad_norm)
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    if args.distributed:
+                        with model.no_sync():
+                            scaler.scale(loss).backward()
+                    else:
+                        scaler.scale(loss).backward()
             else:
-                loss.backward()
-                if args.clip_grad_norm is not None:
-                    nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad_norm)
-                optimizer.step()
-    
+                if update_this_step:
+                    loss.backward()
+                    if args.clip_grad_norm is not None:
+                        nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad_norm)
+                    optimizer.step()
+                else:
+                    if args.distributed:
+                        with model.no_sync():
+                            loss.backward()
+                    else:
+                        loss.backward()
+            #print(i, "norm of conv-proj", torch.norm(model.conv_proj.weight.grad), "[update this step:]", update_this_step)
+            if update_this_step:
+                optimizer.zero_grad()
+
+
             if model_ema and i % args.model_ema_steps == 0:
                 model_ema.update_parameters(model)
                 if epoch < args.lr_warmup_epochs:
@@ -199,6 +216,16 @@ def main(args):
 
     utils.init_distributed_mode(args)
     print(args)
+    # batch size computation
+    num_steps_to_accumulate = 1
+    if args.target_total_batch_size > 0:
+        target_batch = args.target_total_batch_size
+        world_size = args.world_size
+        num_steps_to_accumulate = ( target_batch  + (world_size * args.batch_size) - 1 ) //  (world_size * args.batch_size)
+        print("[GRAD ACC] In order to reach target batch of ",
+            target_batch, " accumulation of ", num_steps_to_accumulate,
+            " across ", world_size, "GPUS with local batch", args.batch_size)
+    
 
         
 
@@ -241,6 +268,7 @@ def main(args):
 
     print("Creating model")
     model = torchvision.models.get_model(args.model, weights=args.weights, num_classes=num_classes)
+    print(model)
     model.to(device)
     if args.distributed and args.sync_bn:
         model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
@@ -366,7 +394,7 @@ def main(args):
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
             train_sampler.set_epoch(epoch)
-        train_one_epoch(model, criterion, optimizer, data_loader, device, epoch, args, model_ema, scaler)
+        train_one_epoch(model, criterion, optimizer, data_loader, device, epoch, args, model_ema, scaler, num_steps_to_accumulate)
         lr_scheduler.step()
         evaluate(model, criterion, data_loader_test, device=device)
         if model_ema:
@@ -405,6 +433,9 @@ def get_args_parser(add_help=True):
     parser.add_argument("--device", default="cuda", type=str, help="device (Use cuda or cpu Default: cuda)")
     parser.add_argument(
         "-b", "--batch-size", default=32, type=int, help="images per gpu, the total batch size is $NGPU x batch_size"
+    )
+    parser.add_argument(
+        "-t", "--target-total-batch-size", default=-1, type=int, help="total batch size is $NGPU x batch_size ; this triggers gradient accumulation to reach target total batch size"
     )
     parser.add_argument("--epochs", default=90, type=int, metavar="N", help="number of total epochs to run")
     parser.add_argument(
